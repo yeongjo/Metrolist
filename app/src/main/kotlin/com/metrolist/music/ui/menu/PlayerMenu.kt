@@ -8,6 +8,7 @@ package com.metrolist.music.ui.menu
 import android.content.Context
 import android.content.Intent
 import android.media.audiofx.AudioEffect
+import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import android.content.res.Configuration
@@ -56,6 +57,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -84,6 +86,7 @@ import com.metrolist.music.LocalDatabase
 import com.metrolist.music.LocalDownloadUtil
 import com.metrolist.music.LocalListenTogetherManager
 import com.metrolist.music.LocalPlayerConnection
+import com.metrolist.music.LocalSyncUtils
 import com.metrolist.music.R
 import com.metrolist.music.constants.ListItemHeight
 import com.metrolist.music.constants.VarispeedKey
@@ -91,6 +94,8 @@ import com.metrolist.music.listentogether.ConnectionState
 import com.metrolist.music.listentogether.ListenTogetherEvent
 import com.metrolist.music.models.MediaMetadata
 import com.metrolist.music.playback.ExoDownloadService
+import com.metrolist.music.playback.queues.ListQueue
+import com.metrolist.music.playback.queues.YouTubePlaylistQueue
 import com.metrolist.music.db.entities.Song
 import com.metrolist.music.db.entities.SpeedDialItem
 import com.metrolist.music.ui.component.BottomSheetState
@@ -103,9 +108,19 @@ import com.metrolist.music.ui.component.VolumeSlider
 import com.metrolist.music.utils.rememberPreference
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.log2
 import kotlin.math.pow
 import kotlin.math.round
+
+private data class PlaylistRemovalTarget(
+    val playlistId: String,
+    val setVideoId: String,
+    val localPlaylistId: String?,
+    val source: String,
+)
+
+private const val PLAYER_MENU_TAG = "PlayerMenu"
 
 @Composable
 fun PlayerMenu(
@@ -119,6 +134,7 @@ fun PlayerMenu(
     val navController = LocalNavController.current
     val context = LocalContext.current
     val database = LocalDatabase.current
+    val syncUtils = LocalSyncUtils.current
     val playerConnection = LocalPlayerConnection.current ?: return
     val playerVolume = playerConnection.service.playerVolume.collectAsStateWithLifecycle()
 
@@ -139,6 +155,38 @@ fun PlayerMenu(
 
     val librarySong by database.song(mediaMetadata.id).collectAsStateWithLifecycle(initialValue = null)
     val coroutineScope = rememberCoroutineScope()
+    val playlistRemovalTarget by produceState<PlaylistRemovalTarget?>(
+        initialValue = null,
+        mediaMetadata.id,
+        mediaMetadata.setVideoId,
+    ) {
+        val queue = playerConnection.service.currentQueue as? YouTubePlaylistQueue
+        val queueSetVideoId = queue?.getSetVideoId(mediaMetadata.id)
+        if (queue?.isEditable == true && !queueSetVideoId.isNullOrBlank()) {
+            value = PlaylistRemovalTarget(
+                playlistId = queue.playlistId,
+                setVideoId = queueSetVideoId,
+                localPlaylistId = null,
+                source = "queue",
+            )
+            return@produceState
+        }
+
+        val listQueue = playerConnection.service.currentQueue as? ListQueue
+        val listQueueBrowseId = listQueue?.playlistBrowseId
+        val listQueueSetVideoId = listQueue?.playlistSetVideoIds?.get(mediaMetadata.id)
+        if (!listQueueBrowseId.isNullOrBlank() && !listQueueSetVideoId.isNullOrBlank()) {
+            value = PlaylistRemovalTarget(
+                playlistId = listQueueBrowseId,
+                setVideoId = listQueueSetVideoId,
+                localPlaylistId = listQueue.playlistId,
+                source = "listQueue",
+            )
+            return@produceState
+        }
+
+        value = null
+    }
 
     val download by LocalDownloadUtil.current
         .getDownload(mediaMetadata.id)
@@ -508,6 +556,62 @@ fun PlayerMenu(
                                 },
                             ),
                         )
+                        playlistRemovalTarget?.let { removalTarget ->
+                            add(
+                                Material3MenuItemData(
+                                    title = { Text(text = stringResource(R.string.remove_from_playlist)) },
+                                    icon = {
+                                        Icon(
+                                            painter = painterResource(R.drawable.delete),
+                                            contentDescription = null,
+                                            modifier = Modifier.size(24.dp),
+                                        )
+                                    },
+                                    onClick = {
+                                        coroutineScope.launch {
+                                            Log.d(
+                                                PLAYER_MENU_TAG,
+                                                "removeFromPlaylist: playlistId=${removalTarget.playlistId}, " +
+                                                    "videoId=${mediaMetadata.id}, setVideoId=${removalTarget.setVideoId}, " +
+                                                    "source=${removalTarget.source}",
+                                            )
+                                            syncUtils.scheduleRemoveFromPlaylist(
+                                                removalTarget.playlistId,
+                                                mediaMetadata.id,
+                                                removalTarget.localPlaylistId ?: removalTarget.playlistId,
+                                            ) {
+                                                removalTarget.setVideoId
+                                            }
+                                            removalTarget.localPlaylistId?.let { localPlaylistId ->
+                                                withContext(Dispatchers.IO) {
+                                                    database.playlistSongMaps(mediaMetadata.id)
+                                                        .firstOrNull { playlistSongMap ->
+                                                            playlistSongMap.playlistId == localPlaylistId &&
+                                                                playlistSongMap.setVideoId == removalTarget.setVideoId
+                                                        }
+                                                        ?.let { playlistSongMap ->
+                                                            database.transaction {
+                                                                move(
+                                                                    playlistSongMap.playlistId,
+                                                                    playlistSongMap.position,
+                                                                    Int.MAX_VALUE,
+                                                                )
+                                                                delete(playlistSongMap.copy(position = Int.MAX_VALUE))
+                                                            }
+                                                        }
+                                                }
+                                            }
+                                            Toast.makeText(
+                                                context,
+                                                R.string.remove_from_playlist,
+                                                Toast.LENGTH_SHORT,
+                                            ).show()
+                                            onDismiss()
+                                        }
+                                    },
+                                )
+                            )
+                        }
                         add(
                             Material3MenuItemData(
                                 title = {
